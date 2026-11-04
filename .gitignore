@@ -1,0 +1,4 @@
+# Build output (recreate with: python3 installer/build.py)
+installer/build/
+dist/
+__pycache__/
