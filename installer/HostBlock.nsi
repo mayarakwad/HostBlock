@@ -2,7 +2,10 @@
 ; build.py passes VERSION, ROOT (project folder), RUNTIME (bundled Python) and OUTFILE.
 ;
 ; Silent install for IT admins:  Hostblock.setup.exe /S [/NOPROTECT] [/NOWEEKLY] [/NODESKTOP]
+;   exit code 0 = OK, 10 = installed but protection could not be turned on,
+;             11 = installed but the weekly update could not be set up
 ; Silent uninstall:              "C:\Program Files\HostBlock\Uninstall.exe" /S
+; Running setup again updates HostBlock and keeps the current settings (the options page is skipped).
 
 Unicode true
 Target amd64-unicode
@@ -18,6 +21,8 @@ RequestExecutionLevel admin
 !define ASSETS "${ROOT}/installer/assets"
 ; Runs hostblock.py with the bundled Python. -I ignores PYTHON* variables and user site-packages.
 !define CLI '"$INSTDIR\runtime\python.exe" -I -X utf8 "$INSTDIR\hostblock.py"'
+; Setup's own runs log next to the weekly task's log, in the admin-only install folder.
+!define LOG '--log "$INSTDIR\hostblock.log"'
 
 Name "HostBlock"
 Caption "HostBlock ${VERSION} Setup"
@@ -59,6 +64,10 @@ Var OptSocial
 Var OptWeekly
 Var OptDesktop
 Var FinishText
+Var FinishTitle
+Var WelcomeText
+Var Upgrade
+Var ExitCode
 
 ; ---------------------------------------------------------------- look & pages
 !define MUI_ICON "${ASSETS}/hostblock.ico"
@@ -72,15 +81,16 @@ Var FinishText
 !define MUI_ABORTWARNING
 
 !define MUI_WELCOMEPAGE_TITLE "Welcome to HostBlock"
-!define MUI_WELCOMEPAGE_TEXT "HostBlock blocks ads, trackers and harmful websites on this computer, in every browser and app.$\r$\n$\r$\nIt adds a well-known list of ad and tracking sites (StevenBlack's hosts list) to your computer's hosts file. Your original file is backed up first, and you can undo everything at any time.$\r$\n$\r$\nClick Next to continue."
+!define MUI_WELCOMEPAGE_TEXT "$WelcomeText"
 !insertmacro MUI_PAGE_WELCOME
 
 Page custom OptionsPage OptionsPageLeave
 
 !insertmacro MUI_PAGE_INSTFILES
 
-!define MUI_FINISHPAGE_TITLE "HostBlock is installed"
+!define MUI_FINISHPAGE_TITLE "$FinishTitle"
 !define MUI_FINISHPAGE_TEXT "$FinishText"
+!define MUI_FINISHPAGE_TEXT_LARGE
 !define MUI_FINISHPAGE_RUN
 !define MUI_FINISHPAGE_RUN_TEXT "Open HostBlock now"
 !define MUI_FINISHPAGE_RUN_FUNCTION LaunchApp
@@ -103,6 +113,17 @@ Function .onInit
     Abort
   ${EndIf}
   SetRegView 64
+  ; Always the admin-only folder, even if /D= was given: the weekly task runs these files as SYSTEM.
+  StrCpy $INSTDIR "$PROGRAMFILES64\HostBlock"
+
+  StrCpy $Upgrade 0
+  StrCpy $FinishTitle "HostBlock is installed"
+  StrCpy $WelcomeText "HostBlock blocks ads, trackers and harmful websites on this computer, in every browser and app.$\r$\n$\r$\nIt adds a well-known list of ad and tracking sites (StevenBlack's hosts list) to your computer's hosts file. Your original file is backed up first, and you can undo everything at any time.$\r$\n$\r$\nClick Next to continue."
+  ${If} ${FileExists} "$INSTDIR\hostblock.py"
+    StrCpy $Upgrade 1
+    StrCpy $FinishTitle "HostBlock is updated"
+    StrCpy $WelcomeText "HostBlock is already installed on this computer. Setup will update it to version ${VERSION} and keep your current settings.$\r$\n$\r$\nTo change settings afterwards, use the HostBlock window.$\r$\n$\r$\nClick Next to continue."
+  ${EndIf}
 
   StrCpy $OptProtect ${BST_CHECKED}
   StrCpy $OptWeekly ${BST_CHECKED}
@@ -151,6 +172,9 @@ FunctionEnd
 
 ; ---------------------------------------------------------------- "Choose your protection" page
 Function OptionsPage
+  ${If} $Upgrade == 1
+    Abort  ; updating: keep the current settings, change them in the HostBlock window
+  ${EndIf}
   !insertmacro MUI_HEADER_TEXT "Choose your protection" "You can change all of this later in the HostBlock window."
   nsDialogs::Create 1018
   Pop $Dialog
@@ -189,6 +213,7 @@ Function OptionsPage
   Pop $0
 
   Call UpdateCategoryState
+  ${NSD_OnBack} OptionsPageLeave       ; keep the choices when the user goes Back
   nsDialogs::Show
 FunctionEnd
 
@@ -234,6 +259,8 @@ Section "HostBlock" SecMain
   File "${ROOT}/hostblock.py"
   File "${ROOT}/HostBlock.pyw"
   File "${ROOT}/README.md"
+  File "${ROOT}/LICENSE"
+  File "${ROOT}/THIRD-PARTY-NOTICES.md"
   File "${ASSETS}/hostblock.ico"
   RMDir /r "$INSTDIR\__pycache__"
   DetailPrint "Installing HostBlock's private copy of Python..."
@@ -248,6 +275,13 @@ Section "HostBlock" SecMain
 
   CreateShortCut "$SMPROGRAMS\HostBlock.lnk" "$INSTDIR\runtime\pythonw.exe" '-I "$INSTDIR\HostBlock.pyw"' \
       "$INSTDIR\hostblock.ico" 0 SW_SHOWNORMAL "" "Turn ad and tracker blocking on or off"
+  ${If} $Upgrade == 1
+    ${If} ${FileExists} "$DESKTOP\HostBlock.lnk"
+      StrCpy $OptDesktop ${BST_CHECKED}  ; refresh the existing one
+    ${Else}
+      StrCpy $OptDesktop ${BST_UNCHECKED}
+    ${EndIf}
+  ${EndIf}
   ${If} $OptDesktop == ${BST_CHECKED}
     CreateShortCut "$DESKTOP\HostBlock.lnk" "$INSTDIR\runtime\pythonw.exe" '-I "$INSTDIR\HostBlock.pyw"' \
         "$INSTDIR\hostblock.ico" 0 SW_SHOWNORMAL "" "Turn ad and tracker blocking on or off"
@@ -268,7 +302,21 @@ Section "HostBlock" SecMain
   IntFmt $0 "0x%08X" $0
   WriteRegDWORD HKLM "${UNINST_KEY}" "EstimatedSize" "$0"
 
-  ; Apply the choices from the "Choose your protection" page.
+  ${If} $Upgrade == 1
+    ; Keep the user's settings: 'update' re-applies the stored list and options (and does
+    ; nothing while protection is off); an existing weekly task already points at these files.
+    DetailPrint "Refreshing the blocklist with your current settings..."
+    nsExec::ExecToLog '${CLI} update ${LOG}'
+    Pop $0
+    StrCpy $FinishText "HostBlock has been updated to version ${VERSION}. Your settings were kept."
+    ${If} $0 != 0
+      StrCpy $FinishText "$FinishText$\r$\n$\r$\nThe blocklist could not be refreshed right now (no internet connection?). Use 'Update now' in HostBlock later."
+    ${EndIf}
+    Return
+  ${EndIf}
+
+  ; First install: apply the choices from the "Choose your protection" page.
+  StrCpy $ExitCode 0
   StrCpy $FinishText "HostBlock is installed. Open it from the Start menu to turn protection on or off."
   ${If} $OptProtect == ${BST_CHECKED}
     StrCpy $1 ""
@@ -288,23 +336,30 @@ Section "HostBlock" SecMain
       StrCpy $1 " --extensions$1"
     ${EndIf}
     DetailPrint "Downloading the latest blocklist and turning on protection..."
-    nsExec::ExecToLog '${CLI} block --compact$1'
+    nsExec::ExecToLog '${CLI} block --compact$1 ${LOG}'
     Pop $0
     ${If} $0 == 0
-      StrCpy $FinishText "Protection is ON: ads and trackers are now blocked on this computer.$\r$\n$\r$\nOpen HostBlock from the Start menu any time to change settings or turn it off."
+      StrCpy $FinishText "Protection is ON: ads and trackers are now blocked on this computer.$\r$\n$\r$\nTo change settings or turn it off, open HostBlock from the Start menu."
     ${Else}
       DetailPrint "Protection could not be turned on (exit code $0)."
-      StrCpy $FinishText "HostBlock is installed, but protection could not be turned on right now - usually because there is no internet connection.$\r$\n$\r$\nOpen HostBlock and click 'Turn protection ON' to try again."
+      StrCpy $FinishText "HostBlock is installed, but protection could not be turned on right now (usually there is no internet connection).$\r$\n$\r$\nOpen HostBlock and click 'Turn protection ON' to try again."
+      StrCpy $ExitCode 10
     ${EndIf}
   ${EndIf}
   ${If} $OptWeekly == ${BST_CHECKED}
     DetailPrint "Setting up the weekly update..."
-    nsExec::ExecToLog '${CLI} schedule'
+    nsExec::ExecToLog '${CLI} schedule ${LOG}'
     Pop $0
     ${If} $0 != 0
       DetailPrint "The weekly update could not be set up (exit code $0)."
-      StrCpy $FinishText "$FinishText$\r$\n$\r$\nNote: the weekly update could not be set up. You can turn it on later in HostBlock."
+      MessageBox MB_ICONEXCLAMATION "The weekly update could not be set up. You can turn it on later in the HostBlock window." /SD IDOK
+      ${If} $ExitCode == 0
+        StrCpy $ExitCode 11
+      ${EndIf}
     ${EndIf}
+  ${EndIf}
+  ${If} $ExitCode != 0
+    SetErrorLevel $ExitCode   ; lets silent deployments see that setup was incomplete
   ${EndIf}
 SectionEnd
 
@@ -334,11 +389,14 @@ Section "Uninstall"
   Delete "$INSTDIR\hostblock.py"
   Delete "$INSTDIR\HostBlock.pyw"
   Delete "$INSTDIR\README.md"
+  Delete "$INSTDIR\LICENSE"
+  Delete "$INSTDIR\THIRD-PARTY-NOTICES.md"
   Delete "$INSTDIR\hostblock.ico"
   Delete "$INSTDIR\schedule.txt"
   Delete "$INSTDIR\task.xml"
+  Delete "$INSTDIR\hostblock.log"
+  Delete "$INSTDIR\hostblock.log.old"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
-  RMDir /r "$APPDATA\HostBlock"   ; weekly-update log (C:\ProgramData\HostBlock)
   DeleteRegKey HKLM "${UNINST_KEY}"
 SectionEnd

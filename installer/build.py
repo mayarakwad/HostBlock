@@ -16,10 +16,11 @@ What it does
 
 Requirements
   - Python 3.8+
-  - NSIS 3.x ("makensis" on PATH)
-        Debian/Ubuntu: sudo apt install nsis zstd
-        macOS:         brew install makensis zstd
-        Windows:       https://nsis.sourceforge.io  (Python 3.14+ handles zstd itself)
+  - NSIS 3 that can build 64-bit installers ("makensis" with amd64-unicode stubs and plugins):
+        Debian/Ubuntu, also inside WSL on Windows:  sudo apt install nsis zstd
+        anywhere else: NSIS built from source with  scons TARGET_ARCH=amd64
+    The official NSIS download and Homebrew's makensis only ship 32-bit stubs, so they
+    can't build this installer; build.py checks this before downloading anything.
   - zstd support: Python 3.14+, the "zstandard" package, or the zstd command
 """
 
@@ -173,10 +174,27 @@ def app_version() -> str:
     return match.group(1)
 
 
-def build_installer() -> None:
+def find_makensis() -> str:
+    """Check that makensis exists and can build 64-bit installers, before the long download."""
     makensis = shutil.which("makensis")
     if not makensis:
         sys.exit("makensis (NSIS 3) was not found on PATH - see the requirements at the top of this file.")
+    BUILD.mkdir(parents=True, exist_ok=True)
+    probe = BUILD / "probe.nsi"
+    probe.write_text('Unicode true\nTarget amd64-unicode\nOutFile "probe.exe"\n'
+                     "Section\n  nsExec::Exec 'cmd /c exit 0'\nSectionEnd\n", encoding="utf-8")
+    result = subprocess.run([makensis, "-V1", str(probe)], cwd=BUILD,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    probe.unlink()
+    (BUILD / "probe.exe").unlink(missing_ok=True)
+    if result.returncode != 0:
+        sys.exit("This NSIS can't build 64-bit installers (no amd64-unicode stubs/plugins).\n"
+                 "Use the Debian/Ubuntu 'nsis' package (also works in WSL), or NSIS built with "
+                 "'scons TARGET_ARCH=amd64'.\n\n" + result.stdout.strip())
+    return makensis
+
+
+def build_installer(makensis: str) -> None:
     DIST.mkdir(exist_ok=True)
     version = app_version()
     log(f"running NSIS for HostBlock {version}")
@@ -189,6 +207,7 @@ def build_installer() -> None:
 
 
 if __name__ == "__main__":
+    nsis = find_makensis()
     if "--installer-only" not in sys.argv or not RUNTIME.exists():
         build_runtime()
-    build_installer()
+    build_installer(nsis)

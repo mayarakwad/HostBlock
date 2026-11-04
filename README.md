@@ -24,7 +24,9 @@ file so you can undo the change completely.
 
 ## Windows: install with the setup wizard
 
-Run **`Hostblock.setup.exe`** and follow the wizard. It works on Windows 10 and 11 (64-bit).
+Download **`Hostblock.setup.exe`** from the
+[latest release](https://github.com/mayarakwad/HostBlock/releases/latest), run it and follow the
+wizard. It works on Windows 10 and 11 (64-bit).
 
 1. **Welcome:** explains what HostBlock does.
 2. **Choose your protection:**
@@ -43,14 +45,18 @@ Notes:
 - **"Windows protected your PC" warning:** the installer isn't code-signed, so SmartScreen may
   show this. Click **More info**, then **Run anyway**. To remove the warning, sign the installer
   with a code-signing certificate.
-- **Running setup again:** this upgrades or repairs HostBlock and keeps your original hosts
-  backup.
+- **Running setup again:** this updates HostBlock to the new version and keeps your current
+  settings (on/off, categories, allowed sites, weekly update) and your original hosts backup. The
+  options page is skipped; change settings in the HostBlock window.
 - **Uninstalling:** use **Settings → Apps → HostBlock → Uninstall**. The uninstaller puts your
   hosts file back exactly as it was before HostBlock, removes the weekly update, and deletes
   everything it installed.
 - **Silent install for IT admins:** `Hostblock.setup.exe /S`, optionally with `/NOPROTECT`,
-  `/NOWEEKLY` or `/NODESKTOP`. Silent uninstall:
-  `"C:\Program Files\HostBlock\Uninstall.exe" /S`.
+  `/NOWEEKLY` or `/NODESKTOP`. The exit code is 0 on success, 10 if protection could not be
+  turned on (for example, no internet access), and 11 if the weekly update could not be set up.
+  Details are logged to `C:\Program Files\HostBlock\hostblock.log`. HostBlock always installs to
+  `C:\Program Files\HostBlock`, and `/D=` is ignored, because the weekly task runs these files
+  with SYSTEM rights. Silent uninstall: `"C:\Program Files\HostBlock\Uninstall.exe" /S`.
 
 ### Building the installer yourself
 
@@ -58,10 +64,12 @@ Notes:
 python3 installer/build.py        # -> dist/Hostblock.setup.exe
 ```
 
-The build needs NSIS 3 (`makensis`) and zstd:
-- Debian/Ubuntu: `sudo apt install nsis zstd`
-- macOS: `brew install makensis zstd`
-- Windows: NSIS from nsis.sourceforge.io
+The build needs zstd and an NSIS 3 (`makensis`) that can build **64-bit** installers:
+- **Debian/Ubuntu, or WSL on Windows:** `sudo apt install nsis zstd`
+- **Anywhere else:** NSIS built from source with `scons TARGET_ARCH=amd64`
+
+The official NSIS download and Homebrew's `makensis` only include 32-bit parts, so they can't
+build this installer. `build.py` checks this before downloading anything.
 
 `build.py` downloads a pinned Python runtime and checks every file against a SHA-256 hash:
 - **Python 3.14.10:** the official NuGet package, published by the Python Software Foundation;
@@ -82,7 +90,9 @@ The wizard's script is `installer/HostBlock.nsi`; its artwork comes from
   for permission each time you open it. Without the installer, double-click
   **`HostBlock.pyw`** (this needs Python from python.org).
 - **macOS:** double-click **`HostBlock.command`**. The first time, macOS may refuse to open a
-  downloaded file; if so, right-click it and choose **Open**. Python from
+  downloaded file. On macOS 15 or newer, go to **System Settings → Privacy & Security** and click
+  **Open Anyway**; on older versions, right-click the file and choose **Open**. You can also run
+  `python3 HostBlock.pyw` in Terminal from the folder. Python from
   [python.org](https://www.python.org/downloads/) is recommended, because Apple's built-in Python
   has an outdated window toolkit. You'll be asked for your Mac password each time you make a
   change.
@@ -188,14 +198,17 @@ On Windows, run `python hostblock.py schedule` from an Administrator Command Pro
 How it behaves:
 
 - **It keeps your settings.** Each run executes `update`, which re-applies the same source,
-  `--extensions`, `--compact` and `--allow` choices you last used with `block`. These are stored in
-  the hosts file's HostBlock header.
+  `--extensions`, `--compact`, `--allow` and `--min-entries` choices you last used with `block`.
+  These are stored in the hosts file's HostBlock header. While protection is off, they are kept in
+  `hosts.hostblock-settings`, so turning protection back on in the window reuses them.
+- **It only manages the system hosts file.** The task runs with admin rights, so `schedule`
+  refuses to work with `--hosts-file`.
 - **It respects "off".** After `unblock`, the weekly run does nothing until you `block` again.
   `restore` removes the task completely, and `unschedule` removes it at any time.
 - **A bad download can't break anything.** If the download fails or doesn't look like a valid
   list, the hosts file is left as it was.
-- **It's logged.** Each run is appended to `/var/log/hostblock.log`, or
-  `C:\ProgramData\HostBlock\hostblock.log` on Windows.
+- **It's logged.** Each run is appended to `/var/log/hostblock.log`, or to
+  `C:\Program Files\HostBlock\hostblock.log` on Windows. Both are places only admins can write.
 - **It runs a protected copy of the script.** A task that runs with admin rights must not run a
   file your normal account can edit, such as one in Downloads: anything running as you could
   change it and gain admin rights. So `schedule` copies `hostblock.py` into an admin-only folder
@@ -204,9 +217,15 @@ How it behaves:
   - macOS: `/Library/Application Support/HostBlock/`
   - Windows: `C:\Program Files\HostBlock\`
 
-  After you update `hostblock.py`, run `schedule` again to refresh the copy. The script also warns
-  you if the Python interpreter itself sits in a folder your user can change (a virtualenv,
-  pyenv, Homebrew, or a "just for me" Python install on Windows).
+  After you update `hostblock.py`, run `schedule` again to refresh the copy.
+- **It checks the Python it runs.** The Python interpreter and its library folder must also be
+  safe from your normal account. If yours isn't, `schedule` uses the root-owned system Python
+  (`/usr/bin/python3`) when there is one; otherwise it prints a warning. Unsafe examples:
+  - a virtualenv, pyenv or Homebrew Python;
+  - python.org's macOS Python, which any admin-group account can change;
+  - on Windows, a Python outside Program Files.
+
+  The Windows installer's bundled Python is safe.
 - **Microsoft Store Python** can't run as SYSTEM. With it, the task runs as you (with admin
   rights) while you're signed in. A python.org install with "Install for all users" avoids this
   limit.
@@ -225,6 +244,12 @@ The backups are kept next to the hosts file (on Windows, the hosts file is
   next `block` takes a fresh backup.
 - **`hosts.hostblock-previous`** is the state just before the most recent change. It is a safety
   net if you ever need to undo an `unblock` or `restore`.
+- **`hosts.hostblock-settings`** remembers your list and options while protection is off.
+  `restore` deletes it.
+
+Backups are written to a temporary file, checked, and only then moved into place, so a full disk
+can never leave a half-written backup behind. If writing the hosts file itself fails part-way,
+the previous version is put back.
 
 To return to exactly what you had before, run `restore`. It also removes the weekly
 auto-update task and its installed files, so nothing HostBlock added is left behind. To stop
@@ -242,8 +267,9 @@ The script doesn't trust the download blindly:
 - Every domain name is syntax-checked. System names (`localhost`, `broadcasthost`, …) are never
   imported.
 - Domains that already appear in your hosts file are skipped, so your own entries always win.
-- If fewer than 1,000 valid domains come back (for example, an error page instead of the list),
-  the script aborts and changes nothing.
+- If the download has fewer than 1,000 valid entries (for example, an error page instead of the
+  list), or the connection breaks off before the whole list arrives, the script aborts and changes
+  nothing. Use `--min-entries` for a small custom list.
 - The hosts file is rewritten in place, which keeps its owner, permissions, Windows ACLs and
   SELinux labels. After writing, the script reads the file back to confirm it saved correctly.
 
@@ -261,10 +287,23 @@ could do, but they can't prove the list is authentic.
 - **Microsoft Defender or other antivirus** may flag hosts file changes (for example
   `SettingsModifier:Win32/HostsFileHijack`). That alert is a reaction to this change. Allow it in
   Defender, or run `unblock` / `restore`.
-- **If a site breaks**, re-run `block` with `--allow thatdomain.com`, or run `unblock`.
+- **If a site breaks**, run `block` again with **all** the options you used before plus
+  `--allow thatdomain.com`. For example:
+  `sudo python3 hostblock.py block --compact --extensions porn --allow thatdomain.com`.
+  Each `block` replaces the stored settings, so leaving an option out turns it off. You can also
+  just run `unblock`.
 - **To keep the list fresh**, use `schedule` (see [Weekly auto-update](#weekly-auto-update)), or
   run `update` by hand whenever you like.
 - **Certificate errors behind a corporate proxy:** point Python at your company's CA bundle, for
   example `SSL_CERT_FILE=/path/to/ca.pem`.
 - **Testing without touching the real file:**
   `python3 hostblock.py --hosts-file ./test-hosts block` needs no admin rights if you own the file.
+  The weekly auto-update is never set up for a test file.
+- **On Windows, a read-only hosts file** (some hosts guides set this) is handled automatically:
+  HostBlock clears the attribute while writing and sets it again afterwards.
+
+## License
+
+HostBlock is released under the [MIT License](LICENSE). The Windows installer also bundles
+Python and Tcl/Tk, which keep their own licenses; see
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

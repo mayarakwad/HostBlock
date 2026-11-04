@@ -72,6 +72,7 @@ class Snapshot:
     categories: set[str] | None = field(default_factory=set)  # None = custom list URL
     compact: bool = os.name == "nt"
     allow: list[str] = field(default_factory=list)
+    min_entries: int = hb.MIN_ENTRIES_DEFAULT
     scheduled: bool = False
     problem: str | None = None
 
@@ -100,11 +101,15 @@ def read_snapshot(hosts: Path) -> Snapshot:
         snap.active = True
         snap.domains = int(info["domains"])
         snap.updated = info.get("updated", "")
-        snap.source, snap.compact, snap.allow = hb.stored_settings(block)
+    # While protection is off, use the settings remembered from the last time it was on.
+    settings = block or (None if snap.problem else hb.saved_settings(hosts))
+    if settings:
+        snap.source, snap.compact, snap.allow = hb.stored_settings(settings)
+        snap.min_entries = hb.stored_min_entries(settings)
         snap.categories = categories_from_url(snap.source)
     try:
         snap.scheduled = hb.schedule_status() is not None
-    except OSError:
+    except Exception:  # never let a status check keep the window from opening
         pass
     return snap
 
@@ -162,6 +167,10 @@ def relaunch_as_admin() -> bool:
 
 
 def friendly_error(output: list[str]) -> str:
+    text = "\n".join(output).lower()
+    if "authentication agent" in text:  # pkexec found no graphical password prompt
+        return ("No password prompt is available on this desktop. Close this window and run:  "
+                f"sudo python3 \"{Path(__file__).resolve()}\"")
     error = next((line for line in reversed(output) if "Error:" in line or "Permission denied" in line), "")
     error = error.split("Error:", 1)[-1].strip()
     lowered = error.lower()
@@ -183,7 +192,10 @@ class App(tk.Tk):
         self.snap = Snapshot()
         self.busy = False
         self.loading = False
-        self.weekly_intent = True          # used while protection is off
+        self.weekly_intent = True          # the user's choice, applied when protection is turned on
+        self.first_refresh = True
+        # Testing on a copy (--hosts-file): never install the system-wide weekly task for it.
+        self.test_mode = bool(extra_args)
         self.events: queue.Queue = queue.Queue()
         self.output: list[str] = []
         self.on_success: Callable[[Snapshot], str] = lambda s: "Done."
@@ -198,6 +210,7 @@ class App(tk.Tk):
             except tk.TclError:
                 pass
         self.resizable(False, False)
+        self.report_callback_exception = self._on_tk_error
         self._styles()
         self._build()
         self.refresh()
@@ -213,6 +226,13 @@ class App(tk.Tk):
                                 "The window can be closed when it has finished.", parent=self)
             return
         self.destroy()
+
+    def _on_tk_error(self, exc, value, tb) -> None:
+        import traceback
+        self._log("".join(traceback.format_exception(exc, value, tb)))
+        self.message.configure(text=f"Something went wrong: {value}", foreground=RED)
+        if not self.log.winfo_ismapped():
+            self.toggle_details()
 
     def destroy(self) -> None:
         try:
@@ -326,14 +346,19 @@ class App(tk.Tk):
         self.detail_label.configure(text=detail)
         self.main_button.configure(text="Turn protection OFF" if s.active else "Turn protection ON")
 
-        if s.active and s.categories is not None:
+        # Show the categories in use (or remembered); while protection is off, keep whatever
+        # the user has ticked since the window opened.
+        if s.categories is not None and (s.active or self.first_refresh):
             for key, var in self.cat_vars.items():
                 var.set(key in s.categories)
-        if s.active and s.categories is None:
+        if s.categories is None:
             self.custom_note.pack(anchor="w", pady=(4, 0), before=self.weekly_check)
         else:
             self.custom_note.pack_forget()
-        self.weekly_var.set(s.scheduled or (not s.active and self.weekly_intent))
+        if s.active or s.scheduled:
+            self.weekly_intent = s.scheduled   # follow reality whenever it is known
+        self.weekly_var.set(not self.test_mode and (s.scheduled or (not s.active and self.weekly_intent)))
+        self.first_refresh = False
         self.loading = False
 
         if not self.can_change:
@@ -367,7 +392,7 @@ class App(tk.Tk):
         set_enabled(self.main_button, enabled and not s.problem)
         set_enabled(self.update_button, enabled and s.active)
         set_enabled(self.undo_button, enabled)
-        set_enabled(self.weekly_check, enabled)
+        set_enabled(self.weekly_check, enabled and not self.test_mode)
         for check in self.cat_checks:
             set_enabled(check, enabled and s.categories is not None)
 
@@ -375,9 +400,12 @@ class App(tk.Tk):
 
     def _block_args(self) -> list[str]:
         args = ["block"]
-        categories = self._selected_categories()
-        if categories:
-            args += ["--extensions", *sorted(categories)]
+        if self.snap.categories is None:          # custom list set up from the command line
+            args += ["--url", self.snap.source]
+        elif self._selected_categories():
+            args += ["--extensions", *sorted(self._selected_categories())]
+        if self.snap.min_entries != hb.MIN_ENTRIES_DEFAULT:
+            args += ["--min-entries", str(self.snap.min_entries)]
         if self.snap.compact:
             args.append("--compact")
         for domain in self.snap.allow:
@@ -390,7 +418,7 @@ class App(tk.Tk):
                      lambda s: "Protection is off. Ads and trackers are no longer blocked.")
             return
         args = self._block_args()
-        if self.weekly_var.get() and not self.snap.scheduled:
+        if self.weekly_var.get() and not self.snap.scheduled and not self.test_mode:
             args.append("--schedule")
         self.run(args, "Downloading the latest list and turning protection on...",
                  lambda s: f"Protection is on: {s.domains:,} sites blocked.")
@@ -405,6 +433,7 @@ class App(tk.Tk):
 
     def on_weekly(self) -> None:
         want = self.weekly_var.get()
+        self.weekly_intent = want
         if self.snap.active or (self.snap.scheduled and not want):
             if want:
                 self.run(["schedule"], "Turning on weekly updates...",
@@ -412,8 +441,6 @@ class App(tk.Tk):
             else:
                 self.run(["unschedule"], "Turning off weekly updates...",
                          lambda s: "Weekly updates are off.")
-        else:
-            self.weekly_intent = want   # applied when protection is turned on
 
     def on_undo(self) -> None:
         if messagebox.askyesno(
@@ -476,7 +503,8 @@ class App(tk.Tk):
                     self._finish(value)
         except queue.Empty:
             pass
-        self._poll_id = self.after(100, self._poll)
+        finally:  # keep polling even if handling one event failed
+            self._poll_id = self.after(100, self._poll)
 
     def _finish(self, rc: int) -> None:
         self.busy = False
@@ -484,9 +512,15 @@ class App(tk.Tk):
         self.progress.pack_forget()
         self.refresh()
         text = "\n".join(self.output)
-        if rc == 0:
+        warning = any(line.startswith("Warning:") for line in self.output)
+        if rc == 0 and warning:
+            self.message.configure(text=self.on_success(self.snap) + "  There is a warning below.",
+                                   foreground=AMBER)
+            if not self.log.winfo_ismapped():
+                self.toggle_details()
+        elif rc == 0:
             self.message.configure(text=self.on_success(self.snap), foreground=GREEN)
-        elif "(-128)" in text or (self.cmd_kind == "pkexec" and rc in (126, 127)):
+        elif "(-128)" in text or (self.cmd_kind == "pkexec" and rc == 126):  # password prompt dismissed
             self.message.configure(text="Cancelled - nothing was changed.", foreground=GREY)
         else:
             self.message.configure(text=friendly_error(self.output), foreground=RED)
@@ -518,7 +552,17 @@ def main() -> None:
 
     hosts = Path(args.hosts_file).resolve() if args.hosts_file else hb.default_hosts_path()
     extra = ["--hosts-file", str(hosts)] if args.hosts_file else []
-    App(hosts, extra).mainloop()
+    try:
+        app = App(hosts, extra)
+    except Exception:
+        # Opened without a console (pythonw), an error would otherwise vanish silently.
+        import traceback
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("HostBlock", "HostBlock could not start:\n\n" + traceback.format_exc(limit=4))
+        root.destroy()
+        return
+    app.mainloop()
 
 
 if __name__ == "__main__":

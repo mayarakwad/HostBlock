@@ -56,6 +56,8 @@ Requires Python 3.8+ and only the standard library.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import http.client
 import ipaddress
 import os
 import platform
@@ -67,6 +69,8 @@ import ssl
 import stat
 import subprocess
 import sys
+import sysconfig
+import tempfile
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -160,9 +164,10 @@ def is_admin() -> bool:
 
 
 def has_write_access(hosts: Path) -> bool:
-    # On Windows os.access() ignores ACLs, so for the real system file trust the admin check.
-    if os.name == "nt" and hosts == default_hosts_path() and not is_admin():
-        return False
+    # On Windows os.access() ignores ACLs and reports a read-only file as "no access" even to an
+    # admin, so for the real system file trust the admin check (write_file handles read-only).
+    if os.name == "nt" and hosts == default_hosts_path():
+        return is_admin()
     target = hosts if hosts.exists() else hosts.parent
     return os.access(target, os.W_OK) and os.access(hosts.parent, os.W_OK)
 
@@ -222,10 +227,39 @@ def read_file(path: Path) -> str:
 def write_file(path: Path, text: str) -> None:
     # Rewrite in place (same file) so ownership, permissions, Windows ACLs and
     # SELinux labels on the hosts file are preserved.
-    with open(path, "w", **FILE_OPTS) as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
+    readonly = os.name == "nt" and path.exists() and not os.access(path, os.W_OK)
+    if readonly:
+        os.chmod(path, stat.S_IWRITE)  # clear the read-only attribute some hosts guides set
+    try:
+        with open(path, "w", **FILE_OPTS) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+    finally:
+        if readonly:
+            os.chmod(path, stat.S_IREAD)
+
+
+def write_backup(path: Path, text: str) -> None:
+    """Save a backup atomically: either a complete, verified copy or nothing under that name.
+
+    The copy is written to a temporary file and then moved over `path`, which also replaces
+    (rather than writes through) anything planted at `path`, such as a symlink.
+    """
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", **FILE_OPTS) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if read_file(Path(tmp)) != text:
+            raise OSError(f"the backup {path} did not read back correctly")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def detect_newline(text: str) -> str:
@@ -279,16 +313,40 @@ def block_info(block: str) -> dict[str, str]:
     return info
 
 
+def _stored_options(block: str) -> dict[str, str]:
+    return dict(tok.split("=", 1) for tok in block_info(block).get("options", "").split() if "=" in tok)
+
+
+def stored_min_entries(block: str) -> int:
+    try:
+        return max(1, int(_stored_options(block).get("min", MIN_ENTRIES_DEFAULT)))
+    except ValueError:
+        return MIN_ENTRIES_DEFAULT
+
+
 def stored_settings(block: str) -> tuple[str, bool, list[str]]:
-    """Recover (url, compact, allow) from an existing HostBlock section."""
+    """Recover (url, compact, allow) from an existing HostBlock section (or a saved-settings file)."""
     info = block_info(block)
-    options = dict(tok.split("=", 1) for tok in info.get("options", "").split() if "=" in tok)
+    options = _stored_options(block)
     if "compact" in options:
         compact = options["compact"] == "yes"
     else:  # sections written by HostBlock 1.0 have no Options line
         compact = any(len(line.split("#", 1)[0].split()) > 2 for line in block.splitlines())
     allow = [a for a in options.get("allow", "").split(",") if a and a != "-"]
     return info.get("source") or DEFAULT_URL, compact, allow
+
+
+def settings_path(hosts: Path) -> Path:
+    """Settings of the last 'block', kept while protection is off so turning it back on reuses them."""
+    return hosts.with_name(hosts.name + ".hostblock-settings")
+
+
+def saved_settings(hosts: Path) -> str | None:
+    """Text of the saved-settings file (same Source/Options lines as the section header), or None."""
+    try:
+        return read_file(settings_path(hosts))
+    except OSError:
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -315,10 +373,15 @@ def download(url: str, timeout: float = 60) -> bytes:
             if not final_url.lower().startswith("https://"):
                 raise HostBlockError(f"download was redirected to a non-HTTPS address ({final_url}).")
             data = resp.read(MAX_DOWNLOAD_BYTES + 1)
+            if len(data) <= MAX_DOWNLOAD_BYTES and resp.length:
+                # Content-Length promised more bytes than arrived: the connection was cut off.
+                raise HostBlockError("the download was cut off before it finished, so nothing was changed.")
     except urllib.error.HTTPError as e:
         raise HostBlockError(f"the server returned HTTP {e.code} for {url}") from e
     except urllib.error.URLError as e:
         raise HostBlockError(f"could not download {url}: {e.reason}") from e
+    except http.client.HTTPException as e:  # e.g. IncompleteRead on a chunked response
+        raise HostBlockError(f"could not download {url}: the connection broke off ({type(e).__name__})") from e
     except OSError as e:
         raise HostBlockError(f"could not download {url}: {e}") from e
     if len(data) > MAX_DOWNLOAD_BYTES:
@@ -372,15 +435,24 @@ def parse_blocklist(text: str, skip: set[str], allow: list[str]) -> tuple[list[s
     return domains, stats
 
 
-def build_block(domains: list[str], source: str, nl: str, compact: bool, allow: list[str]) -> str:
-    source = " ".join(source.split())  # keep the header on one line
+def settings_lines(source: str, compact: bool, allow: list[str], min_entries: int) -> list[str]:
+    source = " ".join(source.split())  # keep it on one line
+    options = f"compact={'yes' if compact else 'no'} allow={','.join(allow) or '-'}"
+    if min_entries != MIN_ENTRIES_DEFAULT:
+        options += f" min={min_entries}"
+    return [f"# Source: {source}", f"# Options: {options}"]
+
+
+def build_block(domains: list[str], source: str, nl: str, compact: bool, allow: list[str],
+                min_entries: int = MIN_ENTRIES_DEFAULT) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    source_line, options_line = settings_lines(source, compact, allow, min_entries)
     lines = [
         START_MARKER,
-        f"# Source: {source}",
+        source_line,
         f"# Updated: {stamp}",
         f"# Domains: {len(domains)}",
-        f"# Options: compact={'yes' if compact else 'no'} allow={','.join(allow) or '-'}",
+        options_line,
         "# Remove: 'hostblock.py unblock'   Original file: 'hostblock.py restore'",
     ]
     if compact:
@@ -454,8 +526,10 @@ def install_dir() -> Path:
 
 
 def default_log_path() -> Path:
+    # The weekly task runs as SYSTEM/root, so its log must live where only admins can write:
+    # on Windows that is the install folder (ProgramData lets any user create the folder first).
     if os.name == "nt":
-        return Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "HostBlock" / "hostblock.log"
+        return install_dir() / "hostblock.log"
     return Path("/var/log/hostblock.log")
 
 
@@ -473,8 +547,10 @@ def scheduler_kind() -> str:
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          stdin=subprocess.DEVNULL, text=True, **NO_WINDOW)
+    # Console tools on Windows print in the OEM code page; never let odd bytes raise.
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                          text=True, encoding="oem" if os.name == "nt" else None, errors="replace",
+                          **NO_WINDOW)
 
 
 def _run_checked(cmd: list[str]) -> None:
@@ -497,37 +573,98 @@ def _writable_by_non_root(path: Path) -> bool:
     return False
 
 
+def _unsafe_for_root(path: Path) -> bool:
+    """POSIX: stricter than _writable_by_non_root - a folder or file that a non-root *group*
+    can write (e.g. python.org's macOS Python, root:admin g+w) also counts as unsafe."""
+    for p in (path, *path.parents):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        sticky = stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX
+        if (st.st_uid != 0 or (st.st_mode & stat.S_IWOTH and not sticky)
+                or (st.st_mode & stat.S_IWGRP and st.st_gid != 0)):
+            return True
+    return False
+
+
+def _python_paths(python: str) -> list[Path]:
+    """The interpreter plus the library folders it imports from (the stdlib is run as root too)."""
+    paths = [Path(python), Path(python).resolve()]
+    if Path(python).resolve() == Path(sys.executable).resolve():
+        libs = [sysconfig.get_paths()["stdlib"], sysconfig.get_paths()["platstdlib"]]
+    else:
+        try:
+            out = subprocess.run([python, "-I", "-c", "import sysconfig as s; p = s.get_paths(); "
+                                  "print(p['stdlib']); print(p['platstdlib'])"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                 text=True, timeout=30, **NO_WINDOW).stdout.split("\n")
+        except (OSError, subprocess.TimeoutExpired):
+            out = []
+        libs = [line for line in out if line.strip()]
+    return paths + [Path(lib) for lib in libs]
+
+
+def _python_is_safe(python: str) -> bool:
+    if os.name == "nt":
+        # Program Files and the Windows folder are admin-only; most other places (a user
+        # profile, C:\PythonXY) can be changed by ordinary accounts.
+        roots = [os.environ.get(v) for v in ("ProgramFiles", "ProgramFiles(x86)", "SystemRoot")]
+        target = os.path.normcase(os.path.abspath(python))
+        return any(r and target.startswith(os.path.normcase(os.path.abspath(r)) + os.sep) for r in roots)
+    return not any(_unsafe_for_root(p) for p in _python_paths(python))
+
+
+def _system_python() -> str | None:
+    """A root-owned system Python 3.8+ to run the weekly task with, if the current one isn't safe."""
+    if os.name == "nt":
+        return None
+    candidate = "/usr/bin/python3"
+    if not Path(candidate).exists():
+        return None
+    if platform.system() == "Darwin":
+        # Apple's /usr/bin/python3 is a stub that pops up an install dialog unless the
+        # Command Line Tools are installed.
+        try:
+            if subprocess.run(["xcode-select", "-p"], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=20).returncode != 0:
+                return None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    try:
+        ok = subprocess.run([candidate, "-I", "-c", "import ssl, sys; sys.exit(sys.version_info < (3, 8))"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return candidate if ok and _python_is_safe(candidate) else None
+
+
 def scheduled_python() -> str:
     exe = Path(sys.executable)
     if os.name == "nt":
         windowless = exe.with_name("pythonw.exe")  # no console window pops up each week
-        if windowless.exists():
-            return str(windowless)
-    return str(exe)
+        return str(windowless if windowless.exists() else exe)
+    if _python_is_safe(str(exe)):
+        return str(exe)
+    return _system_python() or str(exe)
 
 
 def interpreter_warning(python: str) -> str | None:
-    if os.name == "nt":
-        profile = os.environ.get("USERPROFILE", "")
-        if profile and python.lower().startswith(profile.lower() + "\\"):
-            return ("Python is installed only for your user account, so the program the weekly task runs "
-                    "with admin rights sits in a folder your normal account can change. For the safest "
-                    "setup, reinstall Python with 'Install Python for all users' and run 'schedule' again.")
+    if _python_is_safe(python):
         return None
-    if _writable_by_non_root(Path(python)) or _writable_by_non_root(Path(python).resolve()):
-        return (f"{python} can be changed by a non-root user (e.g. a virtualenv, pyenv or Homebrew Python), "
-                "and the weekly task runs it as root. For the safest setup, run 'schedule' with the "
-                "system Python instead, e.g. 'sudo /usr/bin/python3 hostblock.py schedule'.")
-    return None
+    if os.name == "nt":
+        return (f"{python} is not in an admin-only folder (such as Program Files), so a normal account "
+                "may be able to change the program the weekly task runs with SYSTEM rights. For the "
+                "safest setup, use Hostblock.setup.exe or install Python 'for all users' and run 'schedule' again.")
+    return (f"{python} (or its library folder) can be changed without root rights - e.g. a virtualenv, "
+            "pyenv, Homebrew or python.org Python - and the weekly task runs it as root. For the safest "
+            "setup, run 'schedule' with a root-owned system Python, e.g. 'sudo /usr/bin/python3 hostblock.py schedule'.")
 
 
-def task_command(hosts: Path) -> list[str]:
+def task_command() -> list[str]:
     # -I (isolated mode) ignores PYTHON* environment variables and user site-packages.
-    cmd = [scheduled_python(), "-I", str(install_dir() / "hostblock.py"),
-           "update", "--log", str(default_log_path())]
-    if hosts != default_hosts_path():
-        cmd += ["--hosts-file", str(hosts.resolve())]
-    return cmd
+    return [scheduled_python(), "-I", str(install_dir() / "hostblock.py"),
+            "update", "--log", str(default_log_path())]
 
 
 def systemd_units(cmd: list[str], day: str, time: str) -> tuple[str, str]:
@@ -635,7 +772,9 @@ def schedule_status() -> str | None:
     system = platform.system()
     if system == "Windows":
         try:
-            found = _run(["schtasks", "/Query", "/TN", TASK_NAME]).returncode == 0
+            found = subprocess.run(["schtasks", "/Query", "/TN", TASK_NAME], stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                   **NO_WINDOW).returncode == 0
         except OSError:
             found = False
         kind = "windows"
@@ -654,12 +793,12 @@ def schedule_status() -> str | None:
     return f"ON - {when} ({SCHEDULER_LABELS[kind]})"
 
 
-def install_schedule(hosts: Path, day: str, time: str, dry_run: bool) -> str:
+def install_schedule(day: str, time: str, dry_run: bool) -> str:
     kind = scheduler_kind()
     if kind == "none":
         raise HostBlockError("no supported scheduler found (needs systemd or cron). Add this to root's "
-                             f"crontab instead: {CRON_DOW[day]} ... {shlex.join(task_command(hosts))}")
-    cmd = task_command(hosts)
+                             f"crontab instead: {CRON_DOW[day]} ... {shlex.join(task_command())}")
+    cmd = task_command()
     folder = install_dir()
     shown = subprocess.list2cmdline(cmd) if os.name == "nt" else shlex.join(cmd)
     print(f"Weekly auto-update: every {DAY_NAMES[day]} at {time}")
@@ -756,7 +895,8 @@ def remove_schedule(dry_run: bool) -> bool:
     for name in ("schedule.txt", "task.xml"):
         (folder / name).unlink(missing_ok=True)
     if not installed_by_setup():  # never delete the installed app; its uninstaller does that
-        (folder / "hostblock.py").unlink(missing_ok=True)
+        for name in ("hostblock.py", "hostblock.log", "hostblock.log.old"):
+            (folder / name).unlink(missing_ok=True)
         try:
             folder.rmdir()
         except OSError:
@@ -811,11 +951,28 @@ def commit(hosts: Path, current: str, new_text: str, dry_run: bool) -> bool:
         print("[dry run] The hosts file was NOT modified.")
         return False
     _, previous = backup_paths(hosts)
-    write_file(previous, current)
-    write_file(hosts, new_text)
-    if read_file(hosts) != new_text:
-        write_file(hosts, current)
-        raise HostBlockError("the hosts file did not save correctly; the previous version was put back.")
+    try:
+        write_backup(previous, current)
+    except PermissionError:
+        raise
+    except OSError as e:
+        raise HostBlockError(f"could not save a backup of the hosts file ({e}), so nothing was changed.") from e
+    failure: OSError | None = None
+    try:
+        write_file(hosts, new_text)
+        ok = read_file(hosts) == new_text
+    except PermissionError:
+        raise  # opening for writing failed, so the file was not touched
+    except OSError as e:  # e.g. disk full: the file may now be cut off - put the old one back
+        failure, ok = e, False
+    if not ok:
+        reason = failure or "it did not read back correctly"
+        try:
+            write_file(hosts, current)
+        except OSError:
+            raise HostBlockError(f"could not write the hosts file ({reason}) and could not put the old "
+                                 f"version back - a copy of it is in {previous}.") from failure
+        raise HostBlockError(f"could not write the hosts file ({reason}); the previous version was put back.") from failure
     return True
 
 
@@ -825,14 +982,18 @@ def cmd_block(hosts: Path, url: str, allow: list[str], compact: bool,
     bad = [a for a in allow if not re.fullmatch(r"[a-z0-9_.-]+", a)]
     if bad:
         raise HostBlockError(f"invalid --allow domain: {', '.join(bad)}")
-    current = read_file(hosts) if hosts.exists() else ""
-    nl = detect_newline(current)
-    before, block, after = split_managed(current)
-    unmanaged = before + after
+    split_managed(read_file(hosts) if hosts.exists() else "")  # fail fast on a damaged file
 
     print(f"Downloading blocklist: {url}")
     data = download(url)
     print(f"  Downloaded {len(data) / 1_048_576:.1f} MB")
+
+    # Read the hosts file only now, after the (slow) download, so edits other programs made
+    # in the meantime are kept and end up in the backup.
+    current = read_file(hosts) if hosts.exists() else ""
+    nl = detect_newline(current)
+    before, block, after = split_managed(current)
+    unmanaged = before + after
     domains, stats = parse_blocklist(data.decode("utf-8", errors="replace"),
                                      skip=set(hostnames_in(unmanaged)), allow=allow)
 
@@ -846,12 +1007,15 @@ def cmd_block(hosts: Path, url: str, allow: list[str], compact: bool,
     if stats["invalid"]:
         print(f"  Ignored, malformed names .............. {stats['invalid']:,}")
 
-    if len(domains) < min_entries:
+    # Judge the download itself: entries skipped because they are already in the hosts file
+    # or on the allow list still count as valid.
+    valid = len(domains) + stats["existing"] + stats["allowed"]
+    if valid < min_entries:
         raise HostBlockError(
-            f"only {len(domains):,} valid domains found (expected at least {min_entries:,}). "
-            "This does not look like a hosts blocklist, so nothing was changed.")
+            f"the download has only {valid:,} valid entries (expected at least {min_entries:,}). "
+            "It does not look like a hosts blocklist, so nothing was changed.")
 
-    new_block = build_block(domains, url, nl, compact, allow)
+    new_block = build_block(domains, url, nl, compact, allow, min_entries)
     if block is None:
         base = current
         if base and not base.endswith(("\n", "\r")):
@@ -861,13 +1025,25 @@ def cmd_block(hosts: Path, url: str, allow: list[str], compact: bool,
         new_text = before + new_block + after
 
     original = backup_paths(hosts)[0]
-    if not dry_run and not original.exists():
-        write_file(original, unmanaged)
+    if not dry_run and not os.path.lexists(original):
+        try:
+            write_backup(original, unmanaged)
+        except PermissionError:
+            raise
+        except OSError as e:
+            raise HostBlockError(f"could not save a backup of your original hosts file ({e}), "
+                                 "so nothing was changed.") from e
         print(f"Saved a backup of your original hosts file: {original}")
 
     if commit(hosts, current, new_text, dry_run):
         action = "updated" if block else "added"
         print(f"Blocking {action}: {len(domains):,} domains are now blocked in {hosts}")
+        try:  # remembered while protection is off, so turning it back on keeps these settings
+            write_backup(settings_path(hosts), nl.join(
+                ["# HostBlock settings - kept while protection is off; removed by 'restore'",
+                 *settings_lines(url, compact, allow, min_entries)]) + nl)
+        except OSError:
+            pass
         if flush:
             flush_dns()
 
@@ -900,11 +1076,13 @@ def cmd_update(hosts: Path, dry_run: bool, flush: bool) -> None:
         print("Blocking is off - nothing to update. Run 'block' to turn it on.")
         return
     url, compact, allow = stored_settings(block)
-    cmd_block(hosts, url, allow, compact, MIN_ENTRIES_DEFAULT, dry_run, flush)
+    cmd_block(hosts, url, allow, compact, stored_min_entries(block), dry_run, flush)
 
 
 def cmd_restore(hosts: Path, dry_run: bool, flush: bool) -> None:
     restore_hosts_file(hosts, dry_run, flush)
+    if not dry_run:
+        settings_path(hosts).unlink(missing_ok=True)
     # A full revert should leave nothing behind, so the weekly task goes too.
     if hosts == default_hosts_path() and remove_schedule(dry_run) and not dry_run:
         print("The weekly auto-update task was removed as well.")
@@ -913,7 +1091,7 @@ def cmd_restore(hosts: Path, dry_run: bool, flush: bool) -> None:
 def restore_hosts_file(hosts: Path, dry_run: bool, flush: bool) -> None:
     original, previous = backup_paths(hosts)
     current = read_file(hosts) if hosts.exists() else ""
-    if not original.exists():
+    if not original.is_file():
         _, block, _ = split_managed(current)
         if block is None:
             print("No original backup exists and the hosts file has no HostBlock section - "
@@ -964,14 +1142,23 @@ def cmd_status(hosts: Path) -> None:
     print(f"Privileges  : {'Administrator/root' if is_admin() else 'standard user (read-only)'}")
 
 
+def require_system_hosts(hosts: Path) -> None:
+    # The weekly task runs as root/SYSTEM; never point it at a file a normal user controls.
+    if hosts != default_hosts_path():
+        raise HostBlockError("the weekly auto-update only works with the system hosts file "
+                             f"({default_hosts_path()}), not with --hosts-file.")
+
+
 def cmd_schedule(hosts: Path, day: str, time: str, dry_run: bool) -> None:
-    kind = install_schedule(hosts, day, time, dry_run)
+    require_system_hosts(hosts)
+    kind = install_schedule(day, time, dry_run)
     if dry_run:
         return
     print(f"\nWeekly auto-update is ON: every {DAY_NAMES[day]} at {time}. {CATCH_UP[kind]}")
     print("Each run refreshes the blocklist with your current settings and does nothing while blocking is off.")
-    print(f"The task runs a protected copy of this script in {install_dir()};")
-    print("run 'schedule' again after you update hostblock.py so the copy is refreshed.")
+    if not installed_by_setup():
+        print(f"The task runs a protected copy of this script in {install_dir()};")
+        print("run 'schedule' again after you update hostblock.py so the copy is refreshed.")
     current = read_file(hosts) if hosts.exists() else ""
     if split_managed(current)[1] is None:
         print("Note: blocking is currently off - run 'block' to turn it on.")
@@ -1047,7 +1234,8 @@ def interactive(args: argparse.Namespace, hosts: Path, relaunch_args: list[str])
                 if exts is None:
                     continue
                 block = split_managed(read_file(hosts) if hosts.exists() else "")[1]
-                _, compact, allow = stored_settings(block) if block else ("", False, [])
+                stored = block or saved_settings(hosts)
+                _, compact, allow = stored_settings(stored) if stored else ("", False, [])
                 cmd_block(hosts, resolve_url(None, exts), allow, compact,
                           MIN_ENTRIES_DEFAULT, args.dry_run, not args.no_flush)
             elif choice == "2":
@@ -1066,7 +1254,7 @@ def interactive(args: argparse.Namespace, hosts: Path, relaunch_args: list[str])
         except PermissionError as e:
             print(f"Permission denied: {e.filename}")
             print(elevation_help(relaunch_args))
-        except HostBlockError as e:
+        except (HostBlockError, OSError) as e:
             print(f"Error: {e}")
 
 
@@ -1162,6 +1350,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             cmd_status(hosts)
             return 0
+        if args.command == "schedule" or getattr(args, "schedule", False):
+            require_system_hosts(hosts)  # before 'block --schedule' changes anything
         if args.command in ("schedule", "unschedule") or getattr(args, "schedule", False):
             allowed = is_admin()  # system scheduler and install folder need admin/root
         else:
@@ -1195,6 +1385,9 @@ def main(argv: list[str] | None = None) -> int:
         print(elevation_help(relaunch_args), file=sys.stderr)
         return 1
     except HostBlockError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
