@@ -1,7 +1,8 @@
 ; HostBlock setup wizard (NSIS 3). Build it with:  python3 installer/build.py
 ; build.py passes VERSION, ROOT (project folder), RUNTIME (bundled Python) and OUTFILE.
 ;
-; Silent install for IT admins:  Hostblock.setup.exe /S [/NOPROTECT] [/NOWEEKLY] [/NODESKTOP]
+; Silent install for IT admins:  Hostblock.setup.exe /S [/NOPROTECT] [/NOWEEKLY] [/NODESKTOP] [/ADMINONLY]
+;   /ADMINONLY = turning protection on/off keeps requiring an administrator (e.g. parental control)
 ;   exit code 0 = OK, 10 = installed but protection could not be turned on,
 ;             11 = installed but the weekly update could not be set up
 ; Silent uninstall:              "C:\Program Files\HostBlock\Uninstall.exe" /S
@@ -63,6 +64,8 @@ Var OptPorn
 Var OptSocial
 Var OptWeekly
 Var OptDesktop
+Var ChkQuick
+Var OptQuick
 Var FinishText
 Var FinishTitle
 Var WelcomeText
@@ -128,6 +131,7 @@ Function .onInit
   StrCpy $OptProtect ${BST_CHECKED}
   StrCpy $OptWeekly ${BST_CHECKED}
   StrCpy $OptDesktop ${BST_CHECKED}
+  StrCpy $OptQuick ${BST_CHECKED}
   StrCpy $OptFakenews ${BST_UNCHECKED}
   StrCpy $OptGambling ${BST_UNCHECKED}
   StrCpy $OptPorn ${BST_UNCHECKED}
@@ -148,6 +152,11 @@ Function .onInit
   ${GetOptions} $R0 "/NODESKTOP" $R1
   ${IfNot} ${Errors}
     StrCpy $OptDesktop ${BST_UNCHECKED}
+  ${EndIf}
+  ClearErrors
+  ${GetOptions} $R0 "/ADMINONLY" $R1
+  ${IfNot} ${Errors}
+    StrCpy $OptQuick ${BST_UNCHECKED}
   ${EndIf}
 FunctionEnd
 
@@ -187,29 +196,32 @@ Function OptionsPage
   ${NSD_SetState} $ChkProtect $OptProtect
   ${NSD_OnClick} $ChkProtect OnProtectClick
 
-  ${NSD_CreateGroupBox} 0 18u 100% 48u "Also block"
+  ${NSD_CreateGroupBox} 0 15u 100% 45u "Also block"
   Pop $0
-  ${NSD_CreateCheckbox} 10u 32u 44% 12u "&Fake news sites"
+  ${NSD_CreateCheckbox} 10u 27u 44% 12u "&Fake news sites"
   Pop $ChkFakenews
   ${NSD_SetState} $ChkFakenews $OptFakenews
-  ${NSD_CreateCheckbox} 54% 32u 42% 12u "&Gambling sites"
+  ${NSD_CreateCheckbox} 54% 27u 42% 12u "&Gambling sites"
   Pop $ChkGambling
   ${NSD_SetState} $ChkGambling $OptGambling
-  ${NSD_CreateCheckbox} 10u 48u 44% 12u "&Adult content"
+  ${NSD_CreateCheckbox} 10u 42u 44% 12u "&Adult content"
   Pop $ChkPorn
   ${NSD_SetState} $ChkPorn $OptPorn
-  ${NSD_CreateCheckbox} 54% 48u 42% 12u "&Social media"
+  ${NSD_CreateCheckbox} 54% 42u 42% 12u "&Social media"
   Pop $ChkSocial
   ${NSD_SetState} $ChkSocial $OptSocial
 
-  ${NSD_CreateCheckbox} 0 74u 100% 12u "&Keep the list up to date automatically (every Sunday)"
+  ${NSD_CreateCheckbox} 0 65u 100% 12u "&Keep the list up to date automatically (every Sunday)"
   Pop $ChkWeekly
   ${NSD_SetState} $ChkWeekly $OptWeekly
-  ${NSD_CreateCheckbox} 0 90u 100% 12u "Create a &desktop shortcut"
+  ${NSD_CreateCheckbox} 0 79u 100% 20u "&Let anyone using this PC turn protection on or off without an administrator password (untick this for parental control)"
+  Pop $ChkQuick
+  ${NSD_SetState} $ChkQuick $OptQuick
+  ${NSD_CreateCheckbox} 0 101u 100% 12u "Create a &desktop shortcut"
   Pop $ChkDesktop
   ${NSD_SetState} $ChkDesktop $OptDesktop
 
-  ${NSD_CreateLabel} 0 112u 100% 24u "Your current hosts file is backed up before anything changes. To undo everything, use 'Undo everything' in HostBlock or uninstall it."
+  ${NSD_CreateLabel} 0 120u 100% 12u "Your current hosts file is backed up before anything changes."
   Pop $0
 
   Call UpdateCategoryState
@@ -243,6 +255,25 @@ Function OptionsPageLeave
   ${NSD_GetState} $ChkSocial $OptSocial
   ${NSD_GetState} $ChkWeekly $OptWeekly
   ${NSD_GetState} $ChkDesktop $OptDesktop
+  ${NSD_GetState} $ChkQuick $OptQuick
+FunctionEnd
+
+; Background tasks that let any signed-in user turn protection on/off (see hostblock.py install-tasks).
+Function ApplyQuickToggle   ; $OptQuick = BST_CHECKED to allow, otherwise remove
+  ${If} $OptQuick == ${BST_CHECKED}
+    DetailPrint "Letting everyone on this PC turn protection on or off..."
+    nsExec::ExecToLog '${CLI} install-tasks ${LOG}'
+    Pop $0
+    ${If} $0 != 0
+      DetailPrint "The on/off tasks could not be set up (exit code $0)."
+      MessageBox MB_ICONEXCLAMATION "HostBlock couldn't set up turning protection on or off without an administrator password, so the HostBlock window will ask for one." /SD IDOK
+    ${EndIf}
+    WriteRegDWORD HKLM "${UNINST_KEY}" "QuickToggle" 1
+  ${Else}
+    nsExec::ExecToLog '${CLI} remove-tasks ${LOG}'
+    Pop $0
+    WriteRegDWORD HKLM "${UNINST_KEY}" "QuickToggle" 0
+  ${EndIf}
 FunctionEnd
 
 Function LaunchApp
@@ -312,6 +343,16 @@ Section "HostBlock" SecMain
     ${If} $0 != 0
       StrCpy $FinishText "$FinishText$\r$\n$\r$\nThe blocklist could not be refreshed right now (no internet connection?). Use 'Update now' in HostBlock later."
     ${EndIf}
+    ; Keep the earlier on/off choice; versions before 1.3.0 had none, so they get the default (allowed).
+    ClearErrors
+    ReadRegDWORD $2 HKLM "${UNINST_KEY}" "QuickToggle"
+    ${If} ${Errors}
+    ${OrIf} $2 == 1
+      StrCpy $OptQuick ${BST_CHECKED}
+    ${Else}
+      StrCpy $OptQuick ${BST_UNCHECKED}
+    ${EndIf}
+    Call ApplyQuickToggle
     Return
   ${EndIf}
 
@@ -358,6 +399,7 @@ Section "HostBlock" SecMain
       ${EndIf}
     ${EndIf}
   ${EndIf}
+  Call ApplyQuickToggle
   ${If} $ExitCode != 0
     SetErrorLevel $ExitCode   ; lets silent deployments see that setup was incomplete
   ${EndIf}
@@ -378,6 +420,9 @@ Section "Uninstall"
   ${EndIf}
   nsExec::ExecToLog '${CLI} unschedule'
   Pop $0
+  nsExec::ExecToLog '${CLI} remove-tasks'
+  Pop $0
+  Delete "$SYSDIR\drivers\etc\hosts.hostblock-lock"
 
   Delete "$SMPROGRAMS\HostBlock.lnk"
   Delete "$DESKTOP\HostBlock.lnk"

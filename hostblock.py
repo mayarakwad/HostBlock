@@ -71,6 +71,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -78,7 +79,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 
 APP_NAME = "HostBlock"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 STEVENBLACK_BASE = "https://raw.githubusercontent.com/StevenBlack/hosts/master"
 DEFAULT_URL = f"{STEVENBLACK_BASE}/hosts"
@@ -109,7 +110,10 @@ _IP_CHARS_RE = re.compile(r"^[0-9a-f:.]+(?:%[a-z0-9]+)?$")
 MIN_ENTRIES_DEFAULT = 1000          # a real blocklist has tens of thousands
 MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 COMPACT_PER_LINE = 9                # Windows handles up to 9 names per hosts line well
-WRITE_COMMANDS = ("block", "unblock", "restore", "update", "schedule", "unschedule")
+WRITE_COMMANDS = ("block", "unblock", "restore", "update", "enable", "schedule", "unschedule",
+                  "install-tasks", "remove-tasks")
+# Commands that change the hosts file; they take a lock so two runs never collide.
+HOSTS_COMMANDS = ("block", "unblock", "restore", "update", "enable")
 
 # Weekly auto-update
 TASK_NAME = "HostBlock Weekly Update"                    # Windows Task Scheduler
@@ -122,6 +126,15 @@ DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 DAY_NAMES = dict(zip(DAYS, ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")))
 CRON_DOW = {day: (i + 1) % 7 for i, day in enumerate(DAYS)}  # cron and launchd: 0 = Sunday
 DEFAULT_DAY, DEFAULT_TIME = "sun", "10:30"
+# Windows: on-demand tasks (installed by Hostblock.setup.exe) that let any signed-in user turn
+# protection on or off without an administrator prompt. Each runs one fixed command as SYSTEM
+# and takes no input, so starting one can only switch blocking on or off.
+ACTION_TASKS = {"enable": "HostBlock Turn On", "unblock": "HostBlock Turn Off", "update": "HostBlock Update"}
+# SDDL: SYSTEM and Administrators full control; Authenticated Users may read and run, not change.
+ACTION_TASK_SDDL = "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;AU)"
+# The weekly task: everyone may see it (so the window can show it), only admins may change it.
+WEEKLY_TASK_SDDL = "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;AU)"
+LOG_DONE_PREFIX = "=== finished: exit code "
 LOG_MAX_BYTES = 1_000_000
 # On Windows, stop helper programs (ipconfig, schtasks) from flashing a console window
 # when HostBlock runs without one (the GUI, or the scheduled task under pythonw.exe).
@@ -260,6 +273,43 @@ def write_backup(path: Path, text: str) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+@contextlib.contextmanager
+def hosts_lock(hosts: Path, timeout: float = 120.0):
+    """Hold an exclusive lock while changing the hosts file, so e.g. the weekly update and a
+    manual 'turn off' started at the same moment can't undo each other."""
+    lock_path = hosts.with_name(hosts.name + ".hostblock-lock")
+    handle = open(lock_path, "a+")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.monotonic() > deadline:
+                handle.close()
+                raise HostBlockError("another HostBlock run is still busy with the hosts file; try again shortly.")
+            time.sleep(0.5)
+    try:
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def detect_newline(text: str) -> str:
@@ -837,6 +887,7 @@ def install_schedule(day: str, time: str, dry_run: bool) -> str:
             _run_checked(["schtasks", "/Create", "/TN", TASK_NAME, "/XML", str(xml_file), "/F"])
         finally:
             xml_file.unlink(missing_ok=True)
+        set_task_security(TASK_NAME, WEEKLY_TASK_SDDL)  # lets the (unelevated) window see it
     elif kind == "launchd":
         if LAUNCHD_PLIST.exists():
             _run(["launchctl", "bootout", f"system/{LAUNCHD_LABEL}"])
@@ -902,6 +953,107 @@ def remove_schedule(dry_run: bool) -> bool:
         except OSError:
             pass
     return True
+
+
+def task_exists(name: str) -> bool:
+    try:
+        return subprocess.run(["schtasks", "/Query", "/TN", name], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, **NO_WINDOW).returncode == 0
+    except OSError:
+        return False
+
+
+def set_task_security(name: str, sddl: str) -> bool:
+    """Set a scheduled task's permissions (who may see/run/change it) through the Task Scheduler API."""
+    script = ("$s = New-Object -ComObject Schedule.Service; $s.Connect(); "
+              f"$s.GetFolder('\\').GetTask('{name}').SetSecurityDescriptor('{sddl}', 0)")
+    try:
+        return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                               "-Command", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              stdin=subprocess.DEVNULL, timeout=60, **NO_WINDOW).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def action_task_command(action: str) -> list[str]:
+    return [scheduled_python(), "-I", str(install_dir() / "hostblock.py"), action,
+            "--log", str(default_log_path())]
+
+
+def windows_action_task_xml(cmd: list[str], workdir: str) -> str:
+    """An on-demand task (no trigger) that runs one fixed command as SYSTEM."""
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Lets the HostBlock window turn ad and tracker blocking on or off without an administrator prompt. Runs one fixed command (hostblock.py).</Description>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{xml_escape(cmd[0])}</Command>
+      <Arguments>{xml_escape(subprocess.list2cmdline(cmd[1:]))}</Arguments>
+      <WorkingDirectory>{xml_escape(workdir)}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+
+def _require_setup_install_on_windows() -> None:
+    if os.name != "nt":
+        raise HostBlockError("the quick on/off tasks are only used on Windows.")
+    if not installed_by_setup():
+        raise HostBlockError("the quick on/off tasks need HostBlock installed with Hostblock.setup.exe.")
+
+
+def cmd_install_tasks(dry_run: bool) -> None:
+    """Let every signed-in user turn protection on/off and update it without an admin prompt."""
+    _require_setup_install_on_windows()
+    folder = install_dir()
+    for action, name in ACTION_TASKS.items():
+        cmd = action_task_command(action)
+        if dry_run:
+            print(f"[dry run] Would install task '{name}': {subprocess.list2cmdline(cmd)}")
+            continue
+        xml_file = folder / "task.xml"
+        xml_file.write_text(windows_action_task_xml(cmd, str(folder)), encoding="utf-16")
+        try:
+            _run_checked(["schtasks", "/Create", "/TN", name, "/XML", str(xml_file), "/F"])
+        finally:
+            xml_file.unlink(missing_ok=True)
+        if set_task_security(name, ACTION_TASK_SDDL):
+            print(f"Installed '{name}' - any signed-in user can start it.")
+        else:
+            print(f"Warning: installed '{name}', but could not let standard users start it, "
+                  "so turning protection on or off will still ask for administrator permission.")
+    if not dry_run and task_exists(TASK_NAME):
+        set_task_security(TASK_NAME, WEEKLY_TASK_SDDL)
+
+
+def cmd_remove_tasks(dry_run: bool) -> None:
+    """Require administrator permission again for turning protection on or off."""
+    _require_setup_install_on_windows()
+    for name in ACTION_TASKS.values():
+        if not task_exists(name):
+            continue
+        if dry_run:
+            print(f"[dry run] Would remove task '{name}'.")
+            continue
+        _run_checked(["schtasks", "/Delete", "/TN", name, "/F"])
+        print(f"Removed '{name}'.")
 
 
 class _Tee:
@@ -1077,6 +1229,22 @@ def cmd_update(hosts: Path, dry_run: bool, flush: bool) -> None:
         return
     url, compact, allow = stored_settings(block)
     cmd_block(hosts, url, allow, compact, stored_min_entries(block), dry_run, flush)
+
+
+def cmd_enable(hosts: Path, dry_run: bool, flush: bool) -> None:
+    """Turn protection on with the settings it had last time (or the defaults).
+    This is what the 'HostBlock Turn On' task runs, so it takes no options."""
+    current = read_file(hosts) if hosts.exists() else ""
+    if split_managed(current)[1] is not None:
+        print("Protection is already on.")
+        return
+    saved = saved_settings(hosts)
+    if saved:
+        url, compact, allow = stored_settings(saved)
+        min_entries = stored_min_entries(saved)
+    else:
+        url, compact, allow, min_entries = DEFAULT_URL, os.name == "nt", [], MIN_ENTRIES_DEFAULT
+    cmd_block(hosts, url, allow, compact, min_entries, dry_run, flush)
 
 
 def cmd_restore(hosts: Path, dry_run: bool, flush: bool) -> None:
@@ -1323,7 +1491,10 @@ def build_parser() -> argparse.ArgumentParser:
                             help=f"24-hour local time (default: {DEFAULT_TIME})")
     add_common_options(p_schedule, top_level=False)
 
-    for name, text in (("unblock", "remove only the HostBlock section, keeping your other edits"),
+    for name, text in (("enable", "turn protection on again with the settings it had last time"),
+                       ("install-tasks", "Windows: let every user turn protection on/off without an admin prompt"),
+                       ("remove-tasks", "Windows: require an administrator again to turn protection on/off"),
+                       ("unblock", "remove only the HostBlock section, keeping your other edits"),
                        ("restore", "put back the original hosts file and remove the weekly task"),
                        ("update", "refresh the blocklist with the current settings (what the weekly task runs)"),
                        ("unschedule", "remove the weekly auto-update task"),
@@ -1338,6 +1509,17 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     argv = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(argv)
+    rc = 1
+    try:
+        rc = _main(args, argv)
+    finally:
+        if isinstance(sys.stdout, _Tee):
+            # Lets the HostBlock window, which reads this log, see that the run is over.
+            print(f"{LOG_DONE_PREFIX}{rc} ===", flush=True)
+    return rc
+
+
+def _main(args: argparse.Namespace, argv: list[str]) -> int:
     hosts = Path(args.hosts_file).expanduser() if args.hosts_file else default_hosts_path()
     relaunch_args = [a for a in argv if a != "--elevate"]
     flush = not args.no_flush
@@ -1352,7 +1534,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "schedule" or getattr(args, "schedule", False):
             require_system_hosts(hosts)  # before 'block --schedule' changes anything
-        if args.command in ("schedule", "unschedule") or getattr(args, "schedule", False):
+        if (args.command in ("schedule", "unschedule", "install-tasks", "remove-tasks")
+                or getattr(args, "schedule", False)):
             allowed = is_admin()  # system scheduler and install folder need admin/root
         else:
             allowed = has_write_access(hosts)
@@ -1363,18 +1546,27 @@ def main(argv: list[str] | None = None) -> int:
                     return rc
             print(elevation_help(relaunch_args), file=sys.stderr)
             return 1
-        if args.command == "block":
-            cmd_block(hosts, resolve_url(args.url, args.extensions), args.allow,
-                      args.compact, args.min_entries, args.dry_run, flush)
-            if args.schedule:
-                print()
-                cmd_schedule(hosts, DEFAULT_DAY, DEFAULT_TIME, args.dry_run)
-        elif args.command == "unblock":
-            cmd_unblock(hosts, args.dry_run, flush)
-        elif args.command == "restore":
-            cmd_restore(hosts, args.dry_run, flush)
-        elif args.command == "update":
-            cmd_update(hosts, args.dry_run, flush)
+        lock = (hosts_lock(hosts) if args.command in HOSTS_COMMANDS and not args.dry_run
+                else contextlib.nullcontext())
+        with lock:
+            if args.command == "block":
+                cmd_block(hosts, resolve_url(args.url, args.extensions), args.allow,
+                          args.compact, args.min_entries, args.dry_run, flush)
+            elif args.command == "unblock":
+                cmd_unblock(hosts, args.dry_run, flush)
+            elif args.command == "restore":
+                cmd_restore(hosts, args.dry_run, flush)
+            elif args.command == "update":
+                cmd_update(hosts, args.dry_run, flush)
+            elif args.command == "enable":
+                cmd_enable(hosts, args.dry_run, flush)
+        if args.command == "block" and args.schedule:
+            print()
+            cmd_schedule(hosts, DEFAULT_DAY, DEFAULT_TIME, args.dry_run)
+        elif args.command == "install-tasks":
+            cmd_install_tasks(args.dry_run)
+        elif args.command == "remove-tasks":
+            cmd_remove_tasks(args.dry_run)
         elif args.command == "schedule":
             cmd_schedule(hosts, args.day, args.time, args.dry_run)
         elif args.command == "unschedule":

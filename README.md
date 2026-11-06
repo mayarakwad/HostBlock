@@ -33,6 +33,8 @@ wizard. It works on Windows 10 and 11 (64-bit).
    - Turn on protection right away (on by default).
    - Optionally also block fake news, gambling, adult content or social media sites.
    - Keep the list updated weekly (on by default).
+   - Let anyone using the PC turn protection on or off without an administrator password (on by
+     default). Untick this for parental control.
    - Create a desktop shortcut.
 3. **Installing:** copies HostBlock to `C:\Program Files\HostBlock`, downloads the latest list
    and applies your choices.
@@ -48,11 +50,21 @@ Notes:
 - **Running setup again:** this updates HostBlock to the new version and keeps your current
   settings (on/off, categories, allowed sites, weekly update) and your original hosts backup. The
   options page is skipped; change settings in the HostBlock window.
+- **Turning protection on or off needs no administrator password** (unless you unticked that
+  option). Setup creates three small Windows tasks: **HostBlock Turn On**, **HostBlock Turn
+  Off** and **HostBlock Update**. Each runs one fixed command with SYSTEM rights and takes no
+  input, so starting one can only switch blocking on or off or refresh the list. Ordinary
+  accounts can start these tasks but not change them, and the hosts file itself stays protected.
+  This also means anyone using the PC can switch blocking off. If children use the PC and you
+  rely on HostBlock to block adult content, untick the option, or install with `/ADMINONLY`.
+  Changing categories, the weekly update and **Undo everything** still ask for administrator
+  permission.
 - **Uninstalling:** use **Settings → Apps → HostBlock → Uninstall**. The uninstaller puts your
   hosts file back exactly as it was before HostBlock, removes the weekly update, and deletes
   everything it installed.
 - **Silent install for IT admins:** `Hostblock.setup.exe /S`, optionally with `/NOPROTECT`,
-  `/NOWEEKLY` or `/NODESKTOP`. The exit code is 0 on success, 10 if protection could not be
+  `/NOWEEKLY`, `/NODESKTOP` or `/ADMINONLY` (keep requiring an administrator to turn protection
+  on or off). The exit code is 0 on success, 10 if protection could not be
   turned on (for example, no internet access), and 11 if the weekly update could not be set up.
   Details are logged to `C:\Program Files\HostBlock\hostblock.log`. HostBlock always installs to
   `C:\Program Files\HostBlock`, and `/D=` is ignored, because the weekly task runs these files
@@ -86,9 +98,10 @@ The wizard's script is `installer/HostBlock.nsi`; its artwork comes from
 
 ### How to open it
 
-- **Windows:** use the installer above. It adds HostBlock to the Start menu, and Windows asks
-  for permission each time you open it. Without the installer, double-click
-  **`HostBlock.pyw`** (this needs Python from python.org).
+- **Windows:** use the installer above. It adds HostBlock to the Start menu. Opening the window
+  and turning protection on or off need no administrator password. Without the installer,
+  double-click **`HostBlock.pyw`**; this needs Python from python.org, and Windows then asks
+  for permission each time you open it.
 - **macOS:** double-click **`HostBlock.command`**. The first time, macOS may refuse to open a
   downloaded file. On macOS 15 or newer, go to **System Settings → Privacy & Security** and click
   **Open Anyway**; on older versions, right-click the file and choose **Open**. You can also run
@@ -114,7 +127,8 @@ The wizard's script is `installer/HostBlock.nsi`; its artwork comes from
 - **Show details:** shows exactly what happened, which is useful if something goes wrong.
 
 The window doesn't change anything itself. Every change is made by `hostblock.py` with
-administrator rights, so the same backups and safety checks apply.
+administrator rights, either through the on/off tasks (Windows) or after a password prompt, so the
+same backups and safety checks apply.
 
 ## Running it with Administrator / root privileges
 
@@ -158,7 +172,9 @@ sudo python3 hostblock.py block
 | `restore` | Puts back the **exact** original hosts file (byte for byte) from the backup taken before the first `block`, and removes the weekly task. |
 | `update` | Re-downloads the list using the current source and options. This is what the weekly task runs. |
 | `schedule` | Installs a weekly auto-update task (default: Sunday 10:30). See below. |
+| `enable` | Turns protection back on with the settings it had last time. This is what the window's **Turn protection ON** uses. |
 | `unschedule` | Removes the weekly auto-update task. |
+| `install-tasks` / `remove-tasks` | Windows, installed copy only: allow, or stop allowing, every user to turn protection on and off without an administrator password. |
 | `status` | Shows whether blocking is active, how many domains are blocked, when the list was last updated, and whether auto-update is on. |
 | *(none)* | Opens the interactive menu. Option 5 turns auto-update on or off. |
 
@@ -246,6 +262,9 @@ The backups are kept next to the hosts file (on Windows, the hosts file is
   net if you ever need to undo an `unblock` or `restore`.
 - **`hosts.hostblock-settings`** remembers your list and options while protection is off.
   `restore` deletes it.
+- **`hosts.hostblock-lock`** is an empty file. It stops two HostBlock runs from changing the
+  hosts file at the same moment, for example the weekly update and someone turning protection
+  off. The Windows uninstaller deletes it.
 
 Backups are written to a temporary file, checked, and only then moved into place, so a full disk
 can never leave a half-written backup behind. If writing the hosts file itself fails part-way,

@@ -19,11 +19,13 @@ from __future__ import annotations
 import argparse
 import os
 import queue
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +59,16 @@ CATEGORY_LABELS = {
 }
 GREEN, GREY, AMBER, RED = "#1a7f37", "#6e7781", "#b26b00", "#c62828"
 NO_WINDOW = hb.NO_WINDOW
+CANCELLED = -128   # the administrator prompt was declined
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+# The copy that Hostblock.setup.exe installed on Windows: it opens without an administrator
+# prompt and turns protection on/off through the installer's background tasks.
+INSTALLED_WINDOWS = os.name == "nt" and hb.installed_by_setup() and _same_path(HERE, hb.install_dir())
 
 
 # --------------------------------------------------------------------------- #
@@ -155,6 +167,13 @@ def elevated_command(args: list[str]) -> list[str] | None:
     return None
 
 
+def run_elevated_windows(args: list[str]) -> bool:
+    """Windows: run hostblock.py with administrator rights (UAC prompt), hidden. False if declined."""
+    import ctypes
+    params = subprocess.list2cmdline(["-I", "-X", "utf8", str(CLI_SCRIPT), *args])
+    return ctypes.windll.shell32.ShellExecuteW(None, "runas", cli_python(), params, str(HERE), 0) > 32
+
+
 def relaunch_as_admin() -> bool:
     """Windows: reopen this window with administrator rights (UAC prompt)."""
     import ctypes
@@ -200,7 +219,10 @@ class App(tk.Tk):
         self.output: list[str] = []
         self.on_success: Callable[[Snapshot], str] = lambda s: "Done."
         self.cmd_kind = ""
-        self.can_change = elevated_command([]) is not None
+        # Installed on Windows and not elevated: On/Off/Update go through background tasks (no
+        # prompt); other changes ask for administrator permission one at a time.
+        self.windows_tasks = INSTALLED_WINDOWS and not hb.is_admin() and not extra_args
+        self.can_change = self.windows_tasks or elevated_command([]) is not None
 
         self.title("HostBlock")
         icon = HERE / "hostblock.ico"
@@ -214,7 +236,7 @@ class App(tk.Tk):
         self._styles()
         self._build()
         self.refresh()
-        if self.can_change and not hb.is_admin():
+        if self.can_change and not hb.is_admin() and not self.windows_tasks:
             self.message.configure(text="You'll be asked for your password when you make a change.",
                                    foreground=GREY)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -412,16 +434,28 @@ class App(tk.Tk):
             args += ["--allow", domain]
         return args
 
+    def _selection_changed(self) -> bool:
+        """True if the ticked categories differ from the ones in use (or remembered while off)."""
+        s = self.snap
+        return s.categories is not None and self._selected_categories() != s.categories
+
     def on_main(self) -> None:
         if self.snap.active:
             self.run(["unblock"], "Turning protection off...",
-                     lambda s: "Protection is off. Ads and trackers are no longer blocked.")
+                     lambda s: "Protection is off. Ads and trackers are no longer blocked.",
+                     task=hb.ACTION_TASKS["unblock"])
+            return
+        done = lambda s: f"Protection is on: {s.domains:,} sites blocked."  # noqa: E731
+        busy = "Downloading the latest list and turning protection on..."
+        wants_weekly = self.weekly_var.get() and not self.snap.scheduled and not self.test_mode
+        if not wants_weekly and not self._selection_changed():
+            # Same settings as last time: the 'Turn On' task can do it without a prompt.
+            self.run(["enable"], busy, done, task=hb.ACTION_TASKS["enable"])
             return
         args = self._block_args()
-        if self.weekly_var.get() and not self.snap.scheduled and not self.test_mode:
+        if wants_weekly:
             args.append("--schedule")
-        self.run(args, "Downloading the latest list and turning protection on...",
-                 lambda s: f"Protection is on: {s.domains:,} sites blocked.")
+        self.run(args, busy, done)
 
     def on_update(self) -> None:
         if self._categories_changed():
@@ -429,7 +463,8 @@ class App(tk.Tk):
                      lambda s: f"Changes applied: {s.domains:,} sites blocked.")
         else:
             self.run(["update"], "Downloading the latest list...",
-                     lambda s: f"The list is up to date: {s.domains:,} sites blocked.")
+                     lambda s: f"The list is up to date: {s.domains:,} sites blocked.",
+                     task=hb.ACTION_TASKS["update"])
 
     def on_weekly(self) -> None:
         want = self.weekly_var.get()
@@ -465,20 +500,92 @@ class App(tk.Tk):
 
     # ----- running actions ------------------------------------------------- #
 
-    def run(self, args: list[str], busy_text: str, on_success: Callable[[Snapshot], str]) -> None:
+    def run(self, args: list[str], busy_text: str, on_success: Callable[[Snapshot], str],
+            task: str | None = None) -> None:
+        """Run hostblock.py with admin rights. `task` names the background task that can do
+        this without a prompt (used by the installed Windows copy)."""
         if self.busy:
             return
-        cmd = elevated_command([*args, *self.extra_args])
-        if cmd is None:
-            self.refresh()
-            return
-        self.busy, self.on_success, self.output, self.cmd_kind = True, on_success, [], cmd[0]
+        if self.windows_tasks:
+            target, worker_args, kind = self._windows_worker, (args, task), "windows"
+        else:
+            cmd = elevated_command([*args, *self.extra_args])
+            if cmd is None:
+                self.refresh()
+                return
+            target, worker_args, kind = self._worker, (cmd,), cmd[0]
+        self.busy, self.on_success, self.output, self.cmd_kind = True, on_success, [], kind
         self._log(f"\n> hostblock.py {' '.join(args)}\n")
         self.message.configure(text=busy_text, foreground="")
         self.progress.pack(fill="x", pady=(0, 6), before=self.message)
         self.progress.start(12)
         self._update_controls()
-        threading.Thread(target=self._worker, args=(cmd,), daemon=True).start()
+        threading.Thread(target=target, args=worker_args, daemon=True).start()
+
+    def _windows_worker(self, args: list[str], task: str | None) -> None:
+        """Start the background task (no prompt) or, failing that, an elevated run (UAC prompt),
+        then follow the shared log until that run reports it has finished."""
+        log = hb.default_log_path()
+        try:
+            offset = log.stat().st_size
+        except OSError:
+            offset = 0
+        started = False
+        if task:
+            try:
+                started = subprocess.run(["schtasks", "/Run", "/TN", task], stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                         **NO_WINDOW).returncode == 0
+            except OSError:
+                started = False
+            if not started:
+                self.events.put(("line", f"(Couldn't start the '{task}' task, so asking for administrator "
+                                         "permission instead.)"))
+        if not started:
+            try:
+                started = run_elevated_windows([*args, "--log", str(log)])
+            except OSError:
+                started = False
+            if not started:
+                self.events.put(("done", CANCELLED))
+                return
+        self._follow_log(log, offset, args[0])
+
+    def _follow_log(self, log: Path, offset: int, action: str,
+                    start_timeout: float = 45.0, run_timeout: float = 600.0) -> None:
+        """Stream the lines of one run from the log; finish on its 'finished: exit code N' line."""
+        seen, pending = False, ""
+        started_by = time.monotonic() + start_timeout
+        ends_by = time.monotonic() + run_timeout
+        while True:
+            try:
+                size = log.stat().st_size
+            except OSError:
+                size = 0
+            if size < offset:          # the log was rotated: the new file starts with our run
+                offset = 0
+            if size > offset:
+                with open(log, "rb") as f:
+                    f.seek(offset)
+                    chunk = f.read(size - offset)
+                offset += len(chunk)
+                pending += chunk.decode("utf-8", errors="replace")
+                *lines, pending = pending.split("\n")
+                for line in (x.rstrip("\r") for x in lines):
+                    if not seen:  # this run's header: "=== <time> hostblock [options] <action> ... ==="
+                        seen = line.startswith("=== ") and "hostblock" in line and action in line.split()
+                    elif line.startswith(hb.LOG_DONE_PREFIX):
+                        digits = re.sub(r"\D", "", line[len(hb.LOG_DONE_PREFIX):])
+                        self.events.put(("done", int(digits) if digits else 1))
+                        return
+                    else:
+                        self.events.put(("line", line))
+            now = time.monotonic()
+            if (not seen and now > started_by) or now > ends_by:
+                self.events.put(("line", "Error: HostBlock's background task did not respond."))
+                self.events.put(("done", 1))
+                return
+            time.sleep(0.25)
 
     def _worker(self, cmd: list[str]) -> None:
         try:
@@ -520,7 +627,7 @@ class App(tk.Tk):
                 self.toggle_details()
         elif rc == 0:
             self.message.configure(text=self.on_success(self.snap), foreground=GREEN)
-        elif "(-128)" in text or (self.cmd_kind == "pkexec" and rc == 126):  # password prompt dismissed
+        elif rc == CANCELLED or "(-128)" in text or (self.cmd_kind == "pkexec" and rc == 126):  # prompt dismissed
             self.message.configure(text="Cancelled - nothing was changed.", foreground=GREY)
         else:
             self.message.configure(text=friendly_error(self.output), foreground=RED)
@@ -547,7 +654,9 @@ def main() -> None:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("HostBlock.App")
         except Exception:
             pass
-        if not hb.is_admin() and relaunch_as_admin():
+        # The installed copy works without administrator rights (see INSTALLED_WINDOWS);
+        # a copy run from anywhere else reopens itself with them.
+        if not hb.is_admin() and not INSTALLED_WINDOWS and relaunch_as_admin():
             return  # the elevated copy takes over
 
     hosts = Path(args.hosts_file).resolve() if args.hosts_file else hb.default_hosts_path()
